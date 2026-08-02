@@ -32,7 +32,6 @@ import asyncio
 from concurrent import futures
 import io
 import sys
-import threading
 import time
 
 import grpc
@@ -407,15 +406,7 @@ class CameraComponent(util.Component):
         """
         return self._image_annotator
 
-    async def _start_camera_feed(self) -> None:
-        """Create the camera feed task on the connection event loop."""
-        if not self._camera_feed_task or self._camera_feed_task.done():
-            self._enabled = True
-            self._camera_feed_task = asyncio.ensure_future(
-                self._request_and_handle_images())
-
-    def init_camera_feed(
-            self, timeout: float = _CAMERA_RPC_TIMEOUT) -> None:
+    def init_camera_feed(self) -> None:
         """Begin camera feed task.
 
         .. testcode::
@@ -426,69 +417,43 @@ class CameraComponent(util.Component):
                 robot.camera.init_camera_feed()
                 image = robot.camera.latest_image
                 image.raw_image.show()
-
-        :param timeout: Number of seconds to wait for the feed task to be
-            scheduled on the connection thread.
         """
-        if timeout <= 0:
-            raise ValueError('timeout must be greater than zero')
-        if threading.current_thread() is self.conn.thread:
-            asyncio.ensure_future(self._start_camera_feed())
-            return
+        if not self._camera_feed_task or self._camera_feed_task.done():
+            self._enabled = True
+            self._camera_feed_task = self.conn.loop.create_task(self._request_and_handle_images())
 
-        future = self.conn.run_coroutine(self._start_camera_feed())
-        try:
-            future.result(timeout=timeout)
-        except futures.TimeoutError as exc:
-            future.cancel()
-            raise VectorTimeoutException(None) from exc
-
-    async def _close_camera_feed(self, timeout: float) -> None:
-        """Cancel and await the camera feed task on its owning event loop."""
-        deadline = self.conn.loop.time() + timeout
-        self._enabled = False
-        task = self._camera_feed_task
-        self._camera_feed_task = None
-        stream = self._camera_feed_stream
-        if stream is not None:
-            stream.cancel()
-        if task and not task.done():
-            try:
-                await asyncio.wait_for(task, timeout=timeout)
-            except asyncio.TimeoutError as exc:
-                task.cancel()
-                raise VectorTimeoutException(None) from exc
-
-        while True:
-            remaining = deadline - self.conn.loop.time()
-            if remaining <= 0:
-                raise VectorTimeoutException(None)
-            enabled = await self._image_streaming_enabled(
-                min(1.0, remaining))
-            if not enabled:
-                return
-            await asyncio.sleep(min(0.1, remaining))
-
-    def close_camera_feed(
-            self, timeout: float = _CAMERA_RPC_TIMEOUT) -> None:
+    def close_camera_feed(self, timeout: float = _CAMERA_RPC_TIMEOUT) -> None:
         """Cancel the camera feed task within a bounded time.
 
         :param timeout: Number of seconds to wait for the stream to close.
         """
         if timeout <= 0:
             raise ValueError('timeout must be greater than zero')
-        if not self._camera_feed_task:
-            return
-        if threading.current_thread() is self.conn.thread:
-            asyncio.ensure_future(self._close_camera_feed(timeout))
-            return
-
-        future = self.conn.run_coroutine(self._close_camera_feed(timeout))
-        try:
-            future.result(timeout=timeout + 1.0)
-        except futures.TimeoutError as exc:
-            future.cancel()
-            raise VectorTimeoutException(None) from exc
+        if self._camera_feed_task:
+            deadline = time.monotonic() + timeout
+            self._enabled = False
+            if self._camera_feed_stream is not None:
+                self._camera_feed_stream.cancel()
+            else:
+                self._camera_feed_task.cancel()
+            future = self.conn.run_coroutine(self._camera_feed_task)
+            try:
+                future.result(timeout=timeout)
+            except futures.CancelledError:
+                self.logger.debug(
+                    'Camera feed task was cancelled. This is expected during '
+                    'disconnection.')
+            except futures.TimeoutError as exc:
+                future.cancel()
+                raise VectorTimeoutException(None) from exc
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise VectorTimeoutException(None)
+                if not self.image_streaming_enabled(timeout=min(1.0, remaining)):
+                    break
+                time.sleep(min(0.1, remaining))
+            self._camera_feed_task = None
 
     async def _image_streaming_enabled(self, timeout: float) -> bool:
         """request streaming enabled status from the robot"""
@@ -500,8 +465,7 @@ class CameraComponent(util.Component):
             enabled = response.is_image_streaming_enabled
         return enabled
 
-    def image_streaming_enabled(
-            self, timeout: float = _CAMERA_RPC_TIMEOUT) -> bool:
+    def image_streaming_enabled(self, timeout: float = _CAMERA_RPC_TIMEOUT) -> bool:
         """True if image streaming is enabled on the robot
 
         .. testcode::
@@ -518,10 +482,9 @@ class CameraComponent(util.Component):
         """
         if timeout <= 0:
             raise ValueError('timeout must be greater than zero')
-        future = self.conn.run_coroutine(
-            self._image_streaming_enabled(timeout))
+        future = self.conn.run_coroutine(self._image_streaming_enabled(timeout))
         try:
-            return future.result(timeout=timeout + 1.0)
+            return future.result(timeout=timeout)
         except futures.TimeoutError as exc:
             future.cancel()
             raise VectorTimeoutException(None) from exc
@@ -578,12 +541,10 @@ class CameraComponent(util.Component):
         """Request to capture a single image from the robot's camera.
 
         This call requests the robot to capture an image and returns the
-        received image, formatted as a Pillow image. This differs from
-        `latest_image`, which maintains the last image received from the camera
-        feed (if enabled).
+        received image, formatted as a Pillow image. This differs from `latest_image`,
+        which maintains the last image received from the camera feed (if enabled).
 
-        Note that when the camera feed is enabled this call returns the
-        `latest_image`.
+        Note that when the camera feed is enabled this call returns the `latest_image`.
 
         .. testcode::
 
@@ -593,26 +554,19 @@ class CameraComponent(util.Component):
                 image = robot.camera.capture_single_image()
                 image.raw_image.show()
 
-        :param enable_high_resolution: Enable/disable request for high
-            resolution images. The default resolution is 640x360, while the
-            high resolution is 1280x720.
+        :param enable_high_resolution: Enable/disable request for high resolution images. The default resolution
+                                       is 640x360, while the high resolution is 1280x720.
         :param timeout: Number of seconds to wait for the gRPC response.
         """
         if timeout <= 0:
             raise ValueError('timeout must be greater than zero')
         if self._enabled:
-            self.logger.warning(
-                'Camera feed is enabled. Receiving image from the feed at '
-                'default resolution.')
+            self.logger.warning('Camera feed is enabled. Receiving image from the feed at default resolution.')
             return self._latest_image
         if enable_high_resolution:
-            self.logger.warning(
-                'Capturing a high resolution (1280*720) image. Image events '
-                'for this frame need to be scaled.')
-        req = protocol.CaptureSingleImageRequest(
-            enable_high_resolution=enable_high_resolution)
-        res = await self.grpc_interface.CaptureSingleImage(
-            req, timeout=timeout)
+            self.logger.warning('Capturing a high resolution (1280*720) image. Image events for this frame need to be scaled.')
+        req = protocol.CaptureSingleImageRequest(enable_high_resolution=enable_high_resolution)
+        res = await self.grpc_interface.CaptureSingleImage(req, timeout=timeout)
         if res and res.data:
             image = _convert_to_pillow_image(res.data)
             return CameraImage(image, self._image_annotator, res.image_id)
